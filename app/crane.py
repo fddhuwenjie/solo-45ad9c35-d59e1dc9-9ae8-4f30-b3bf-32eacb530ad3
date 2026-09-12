@@ -133,6 +133,41 @@ def _chart_fingerprint(rows) -> str:
 
 
 # ================================================================ 路径采样
+def _max_actual_step_deg(ua, ub, n: int) -> float:
+    """ua->ub 按 n 段 Euler 插值时, 相邻采样姿态的最大实际测地转角 °。"""
+    prev = ua
+    mx = 0.0
+    for j in range(1, n + 1):
+        t = j / n
+        att = (ua[0] + (ub[0] - ua[0]) * t,
+               ua[1] + (ub[1] - ua[1]) * t,
+               ua[2] + (ub[2] - ua[2]) * t)
+        rot = geodesic_deg(rot_matrix(*prev), rot_matrix(*att))
+        if rot > mx:
+            mx = rot
+        prev = att
+    return mx
+
+
+_REFINE_MAX_ITERS = 25
+
+
+def _refine_attitude_n(ua, ub, n: int, step_deg: float) -> int:
+    """
+    加密分段数, 直到相邻插值姿态的实际测地转角 <= step_deg。
+
+    端点测地角/n 只是下界: 复合 yaw/pitch/roll 的 Euler 插值路径可绕过
+    近万向锁区域, 实际相邻转角远大于端点估计(如 (170,170,170) 端点测地角
+    仅 16.8°, n=4 时实际相邻转角达 62°), 必须按实际转角迭代加密。
+    """
+    for _ in range(_REFINE_MAX_ITERS):
+        actual = _max_actual_step_deg(ua, ub, n)
+        if actual <= step_deg + 1e-9:
+            return n
+        n = max(n + 1, math.ceil(n * actual / step_deg))
+    return n  # 极端不收敛: 所需采样量巨大, 交由采样上限机制列证据缺口
+
+
 def _sample_path(path, step_m: float,
                  rot_step_deg: Optional[float] = None,
                  max_samples: Optional[int] = None,
@@ -166,6 +201,9 @@ def _sample_path(path, step_m: float,
             rot = geodesic_deg(rot_matrix(*unwrapped[k]),
                                rot_matrix(*unwrapped[k + 1]))
             n = max(n, math.ceil(rot / rot_step_deg - 1e-9))
+            if rot > 0.0:
+                n = _refine_attitude_n(unwrapped[k], unwrapped[k + 1],
+                                       n, rot_step_deg)
             if jump_deg is not None and rot > jump_deg:
                 jumps.append({"segment": f"{a.id}->{b.id}",
                               "from_pose": a.id, "to_pose": b.id,
@@ -287,14 +325,16 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
     cx, cy = setup.slewing_center
     limit = setup.ground_bearing_limit_kpa
 
-    # 净空: 相邻采样间包络表面点最大位移(扫掠界), 供保守净空折减
-    sweeps: List[float] = [0.0] * len(samples)
+    # 净空: interval_sweeps[k] = 采样区间 (k, k+1) 内包络表面点的最大位移
+    # (扫掠界); 采样点 i 的保守净空折减取相邻区间 (i-1,i) 与 (i,i+1) 的
+    # 较大者, 保证区间保守净空 min(c_i, c_{i+1}) - D/2 不被高估。
+    interval_sweeps: List[float] = []
     if clr_ctx is not None and not clr_ctx["degenerate"]:
-        for i in range(1, len(samples)):
-            d_hook = math.dist(samples[i - 1]["position"], samples[i]["position"])
-            d_theta = geodesic_deg(rot_matrix(*samples[i - 1]["attitude"]),
-                                   rot_matrix(*samples[i]["attitude"]))
-            sweeps[i] = sweep_bound(d_hook, d_theta, clr_ctx["r_max"])
+        for k in range(len(samples) - 1):
+            d_hook = math.dist(samples[k]["position"], samples[k + 1]["position"])
+            d_theta = geodesic_deg(rot_matrix(*samples[k]["attitude"]),
+                                   rot_matrix(*samples[k + 1]["attitude"]))
+            interval_sweeps.append(sweep_bound(d_hook, d_theta, clr_ctx["r_max"]))
 
     out_samples: List[Dict[str, Any]] = []
     first_of_kind: Dict[str, Dict[str, Any]] = {}
@@ -379,8 +419,8 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
             }
             if not clr_ctx["degenerate"]:
                 ev = _clr_eval_sample(clr_ctx, s["position"], att)
-                sweep = max(sweeps[i - 1] if i > 0 else 0.0,
-                            sweeps[i + 1] if i + 1 < len(samples) else 0.0)
+                sweep = max(interval_sweeps[i - 1] if i > 0 else 0.0,
+                            interval_sweeps[i] if i < len(interval_sweeps) else 0.0)
                 margin = clr_ctx["safety_margin_m"]
                 c_obs = ev["min_clearance_m"]
                 c_obs_cons = c_obs - sweep / 2.0 if c_obs is not None else None

@@ -404,6 +404,92 @@ def test_clearance_input_validation(client_no_db):
     assert r.status_code == 422 and "障碍物/不可侵入区 id 重复" in r.text
 
 
+# ---------------------------------------------------------------- 回归: 采样间穿透
+def test_thin_obstacle_pass_through_between_samples(client_no_db):
+    """回归: 步长 2 m 的两点路径, 0.2 m 包络在采样点之间穿过薄障碍。
+
+    端点净空均为正(x=5 -> 1.3, x=7 -> 0.3), 但区间扫掠 2 m 使 x=7 处
+    保守净空 0.3-1.0=-0.7 < 0: 必须判碰撞并阻断 approvable。
+    """
+    setup = make_setup(
+        path=[{"id": "P0", "position": [5, 0, 18]},
+              {"id": "P1", "position": [7, 0, 18]}],
+        path_step_m=2.0,
+        clearance={
+            "envelope": {"length_m": 0.2, "width_m": 0.2, "height_m": 0.2},
+            "hook_to_center_offset": [0, 0, -5],
+            "obstacles": [{"id": "THIN", "min_corner": [6.4, -1, 10],
+                           "max_corner": [6.6, 1, 14]}],
+            "safety_margin_m": 0.0,
+        },
+    )
+    r = check_crane_duty(setup, HOOK_DYN)
+    assert len(r["samples"]) == 2  # 步长 2 m -> 仅端点采样
+    assert [c["code"] for c in r["conflicts"]] == ["CRANE_COLLISION"]
+    assert r["clearance"]["status"] == "violation"
+    s0, s1 = r["samples"]
+    assert s0["clearance"]["sweep_margin_m"] == pytest.approx(1.0)
+    assert s1["clearance"]["sweep_margin_m"] == pytest.approx(1.0)  # 回归: 曾为 0
+    assert s1["clearance"]["conservative_clearance_m"] == pytest.approx(-0.7)
+    fv = r["clearance"]["first_violation"]
+    assert fv["kind"] == "COLLISION"
+    assert fv["interval"]["from"][0] == pytest.approx(5.0)
+    assert fv["interval"]["to"][0] == pytest.approx(7.0)
+
+    b = client_no_db.post("/api/lifts/analyze",
+                          json=lift_payload(setup.model_dump())).json()
+    assert b["approvable"] is False
+    assert "CRANE_COLLISION" in b["blocking_codes"]
+
+
+# ---------------------------------------------------------------- 回归: 复合姿态细分
+def test_compound_attitude_subdivision_respects_step():
+    """回归: (0,0,0)->(170,170,170), 端点测地角仅 16.8° 但 Euler 插值
+    绕过近万向锁区域, 相邻实际转角曾达 61.9953°; 细分后必须 <= 5°。"""
+    setup = make_setup(
+        path=[{"id": "P0", "position": [5, 0, 18]},
+              {"id": "P1", "position": [9, 0, 18], "yaw_deg": 170,
+               "pitch_deg": 170, "roll_deg": 170}],
+        clearance={
+            "envelope": {"length_m": 4, "width_m": 2, "height_m": 2},
+            "hook_to_center_offset": [0, 0, -5],
+            "obstacles": [], "attitude_step_deg": 5.0,
+        },
+    )
+    r = check_crane_duty(setup, HOOK_DYN)
+    samples = r["samples"]
+    assert len(samples) > 12  # 端点估计仅 4 段, 实际需数十段
+    for a, b in zip(samples, samples[1:]):
+        aa, bb = a["attitude_deg"], b["attitude_deg"]
+        rot = geodesic_deg(
+            rot_matrix(aa["yaw"], aa["pitch"], aa["roll"]),
+            rot_matrix(bb["yaw"], bb["pitch"], bb["roll"]))
+        assert rot <= 5.0 + 0.02  # 显示角两位小数回绕的误差余量
+    assert r["clearance"]["sampling"]["capped"] is False
+    assert r["evidence_gaps"] == []
+
+
+def test_compound_attitude_step_blocked_by_cap_flags_gap():
+    """复合姿态所需细分超采样上限时, 必须列证据缺口而非静默放行。"""
+    setup = make_setup(
+        path=[{"id": "P0", "position": [5, 0, 18]},
+              {"id": "P1", "position": [9, 0, 18], "yaw_deg": 170,
+               "pitch_deg": 170, "roll_deg": 170}],
+        clearance={
+            "envelope": {"length_m": 4, "width_m": 2, "height_m": 2},
+            "hook_to_center_offset": [0, 0, -5],
+            "obstacles": [], "attitude_step_deg": 5.0, "max_samples": 20,
+        },
+    )
+    r = check_crane_duty(setup, HOOK_DYN)
+    samp = r["clearance"]["sampling"]
+    assert samp["required_samples"] > 20
+    assert samp["capped"] is True
+    assert len(r["samples"]) <= 20
+    gaps = [g["code"] for g in r["evidence_gaps"]]
+    assert "CLEARANCE_SAMPLING_CAP" in gaps
+
+
 # ---------------------------------------------------------------- 版本库集成
 def test_revision_flow_clearance_blocks_and_diffs(client_db):
     far = {"id": "OB1", "min_corner": [20, -2, 10], "max_corner": [21, 2, 14]}
