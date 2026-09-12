@@ -1,0 +1,71 @@
+# 构件试吊重心反演与索具核算 API
+
+基于刚体静力学的大型构件吊装核算 FastAPI 服务：多索受力求解（静定 / 超定 / 静不定弹性分配）、
+低高度试吊张力反算实际重心、吊索 / 卸扣 / 吊梁利用率核算、人工调整复核，以及 SQLite 方案版本与审批流。
+线性代数为纯 Python 实现（`app/linalg.py`），不依赖 numpy。
+
+## 环境要求
+
+- Python **3.11 及以上**（支持 3.11 / 3.12 / 3.13）
+- 依赖：FastAPI、Pydantic v2、uvicorn；测试另需 pytest、httpx
+
+## 安装
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"            # -e 可编辑安装; [dev] 装上 pytest/httpx
+```
+
+无网络环境时可改用离线依赖目录：
+
+```bash
+pip install -e . --no-index --find-links .pylibs
+```
+
+## 启动
+
+入口固定为 `app.main:app`：
+
+```bash
+# 方式一: console 脚本
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# 方式二: 模块方式
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# 方式三: python -m app.main（同样监听 0.0.0.0:8000）
+python -m app.main
+```
+
+启动后：
+
+- 健康检查：`GET http://localhost:8000/health`
+- 交互式 API 文档：`http://localhost:8000/docs`
+
+## 环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `LIFTCALC_DB` | SQLite 版本库文件路径。**未设置（或为空）时不建库、不读写任何文件**：`/health` 返回 `"storage": "disabled"`，纯计算接口（`/api/lifts/*`）完全可用，版本库接口（`/api/plans/*`）返回 503。 |
+
+启用 SQLite 版本库（文件不存在会自动建表）：
+
+```bash
+LIFTCALC_DB=./liftcalc.db uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+## 测试
+
+```bash
+pytest                 # 配置已在 pytest.ini 中(testpaths=tests)
+pytest -q tests/test_smoke.py     # 仅跑冒烟用例(不写固定数据库)
+```
+
+冒烟用例覆盖：模块导入、无 `LIFTCALC_DB` 时 `/health` 降级可用、一次对称四索核算
+（四索等张力、吊钩动载 1100 kN）、临时 SQLite 库的版本保存与读回（`mkstemp` 路径，结束即删除）。
+
+## 单位约定
+
+SI 制：长度 m，力 kN，质量 kg（内部按 g 换算 kN），角度 °（接口）/ rad（内部）。
+构件本体坐标：x 沿梁长纵向、y 横向、z 竖直向上。

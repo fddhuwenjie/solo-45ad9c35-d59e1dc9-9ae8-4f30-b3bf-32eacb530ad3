@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liftcalc"
+description = "大型构件试吊重心反演与吊装索具核算 FastAPI 服务"
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: FastAPI",
+]
+dependencies = [
+    # ASGI 服务与入参校验; 代码使用 Pydantic v2 专属 API(field_validator/model_validator/model_dump)
+    "fastapi>=0.110,<1.0",
+    "pydantic>=2.5,<3",
+    "uvicorn>=0.27,<1.0",
+]
+
+[project.optional-dependencies]
+# 运行 pytest 需要(starlette TestClient 依赖 httpx 发起进程内请求)
+dev = [
+    "httpx>=0.27,<1.0",
+    "pytest>=8,<10",
+]
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.setuptools.dynamic]
+# 版本号唯一来源: app/__init__.py 的 __version__
+version = { attr = "app.__version__" }
