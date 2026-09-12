@@ -549,6 +549,13 @@ def analyze_lift(inp, inverse: Optional[Dict[str, Any]] = None) -> Dict[str, Any
                 "evidence": hoist,
             })
 
+    # ---------- 起重机工况(回转路径逐姿态校核, 复用吊钩动载) ----------
+    crane_result = None
+    if inp.crane is not None:
+        from .crane import check_crane_duty  # 局部导入, 避免与 crane 模块循环依赖
+        crane_result = check_crane_duty(inp.crane, hook_load_dyn)
+        conflicts.extend(crane_result["conflicts"])
+
     # ---------- 载荷分配比例
     shares = {
         geo.leg_ids[i]: round(lower.tensions[i] * dirs_b[i][2] / W_lower_dyn, 4)
@@ -588,6 +595,7 @@ def analyze_lift(inp, inverse: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         "legs": leg_results,
         "beam": beam_result,
         "hoist": hoist,
+        "crane": crane_result,
         "conflicts": conflicts,
         "evidence_gaps": evidence_gaps,
         "warnings": warnings,
@@ -1244,6 +1252,11 @@ def _util_summary(analysis: Dict[str, Any]) -> Dict[str, Any]:
             (t["sling_utilization"] for t in b["top_slings"]), default=0.0)
     if analysis.get("hoist"):
         out["hoist_utilization"] = analysis["hoist"]["utilization"]
+    if analysis.get("crane"):
+        env = analysis["crane"]["envelope"]
+        out["crane_max_load_utilization"] = env["max_load_utilization"]
+        out["crane_max_ground_pressure_kpa"] = env["max_ground_pressure_kpa"]
+        out["crane_min_outrigger_reaction_kn"] = env["min_outrigger_reaction_kn"]
     return out
 
 

@@ -13,6 +13,7 @@ from typing import List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 Vec3 = Tuple[float, float, float]
+Vec2 = Tuple[float, float]
 
 # ---------------------------------------------------------------- 基础构件
 class LegIn(BaseModel):
@@ -129,6 +130,129 @@ class CounterweightStationIn(BaseModel):
     capacity_kg: float = Field(..., ge=0)
 
 
+# ---------------------------------------------------------------- 起重机工况校核
+class CraneComponentIn(BaseModel):
+    """起重机部件(臂架/转台/底盘等)的重量与重心。
+
+    cog 在起重机参考系中给出: 原点 = 回转中心, x = 吊臂正前方(回转角 0°), z 向上。
+    slews=True(默认)表示该部件随转台回转, 其重心按吊钩方位角同步旋转;
+    底盘/车架类部件应取 False。
+    """
+
+    id: str = Field(..., min_length=1)
+    weight_kn: float = Field(..., gt=0, description="部件重量 kN")
+    cog: Vec3 = Field(..., description="重心 [x,y,z] m(起重机参考系)")
+    slews: bool = Field(True, description="是否随转台回转")
+
+    @field_validator("cog")
+    @classmethod
+    def _c3(cls, v: Vec3) -> Vec3:
+        return (float(v[0]), float(v[1]), float(v[2]))
+
+
+class CraneCounterweightIn(BaseModel):
+    """起重机配重(通常随转台回转, 位于吊臂反侧)。"""
+
+    weight_kn: float = Field(..., gt=0)
+    cog: Vec3 = Field(..., description="重心 [x,y,z] m(起重机参考系)")
+    slews: bool = True
+
+    @field_validator("cog")
+    @classmethod
+    def _c3(cls, v: Vec3) -> Vec3:
+        return (float(v[0]), float(v[1]), float(v[2]))
+
+
+class OutriggerIn(BaseModel):
+    """一个支腿及其垫板(位置相对回转中心)。"""
+
+    id: str = Field(..., min_length=1)
+    position: Vec2 = Field(..., description="支腿中心 [x,y] m(相对回转中心)")
+    mat_length_m: float = Field(..., gt=0, description="垫板长度 m(沿 mat_angle_deg 方向)")
+    mat_width_m: float = Field(..., gt=0, description="垫板宽度 m")
+    mat_angle_deg: float = Field(0.0, description="垫板在水平面内的转角 °")
+
+    @field_validator("position")
+    @classmethod
+    def _p2(cls, v: Vec2) -> Vec2:
+        return (float(v[0]), float(v[1]))
+
+
+class LoadChartRowIn(BaseModel):
+    """载荷表一行: 某臂长、某回转区段、某半径档位的额定总能力。"""
+
+    boom_length_m: float = Field(..., gt=0)
+    zone: str = Field(..., min_length=1, description="回转区段标识, 如 360 / rear / side")
+    radius_m: float = Field(..., gt=0)
+    capacity_kn: float = Field(..., gt=0, description="该档位额定总能力(含吊钩滑轮组) kN")
+
+
+class HookPoseIn(BaseModel):
+    """吊钩路径上的一个姿态(试吊点 -> 安装点, 世界坐标)。"""
+
+    id: str = Field(..., min_length=1)
+    position: Vec3 = Field(..., description="吊钩位置 [x,y,z] m(世界系)")
+    zone: Optional[str] = Field(
+        None, description="该姿态所在回转区段; 缺省用起重机 default_zone"
+    )
+
+    @field_validator("position")
+    @classmethod
+    def _p3(cls, v: Vec3) -> Vec3:
+        return (float(v[0]), float(v[1]), float(v[2]))
+
+
+class CraneSetupIn(BaseModel):
+    """起重机站位与工况: 几何 + 自重/配重 + 载荷表 + 回转路径。"""
+
+    crane_id: str = Field("CR1", min_length=1)
+    slewing_center: Vec2 = Field(..., description="回转中心 [x,y] m(世界系)")
+    slew_reference_deg: float = Field(
+        0.0, description="吊臂正前方(回转角 0°)的世界方位角 °(自 +x 逆时针)"
+    )
+    boom_length_m: float = Field(..., gt=0, description="当前臂长 m(载荷表按此精确匹配)")
+    components: List[CraneComponentIn] = Field([], description="起重机部件重量与重心")
+    counterweight: Optional[CraneCounterweightIn] = None
+    hook_block_weight_kn: float = Field(..., ge=0, description="吊钩滑轮组重量 kN")
+    outriggers: List[OutriggerIn] = Field(..., min_length=3)
+    ground_bearing_limit_kpa: float = Field(..., gt=0, description="地基承压限值 kPa")
+    default_zone: str = Field("360", min_length=1, description="姿态未指定时采用的回转区段")
+    load_chart: List[LoadChartRowIn] = Field(..., min_length=1)
+    path: List[HookPoseIn] = Field(..., min_length=2, description="试吊点 -> 安装点的吊钩路径")
+    path_step_m: float = Field(1.0, gt=0, description="相邻姿态间的插值步长 m")
+
+    @field_validator("slewing_center")
+    @classmethod
+    def _c2(cls, v: Vec2) -> Vec2:
+        return (float(v[0]), float(v[1]))
+
+    @model_validator(mode="after")
+    def _chk(self) -> "CraneSetupIn":
+        oids = [o.id for o in self.outriggers]
+        if len(set(oids)) != len(oids):
+            raise ValueError("支腿 id 重复")
+        pids = [p.id for p in self.path]
+        if len(set(pids)) != len(pids):
+            raise ValueError("路径姿态 id 重复")
+        cids = [c.id for c in self.components]
+        if len(set(cids)) != len(cids):
+            raise ValueError("起重机部件 id 重复")
+        keys = [(r.boom_length_m, r.zone, r.radius_m) for r in self.load_chart]
+        if len(set(keys)) != len(keys):
+            raise ValueError("载荷表存在重复的 (臂长, 区段, 半径) 档位")
+        # 支腿平面布置不得退化(共线时无法形成稳定支撑平面)
+        xs = [o.position[0] for o in self.outriggers]
+        ys = [o.position[1] for o in self.outriggers]
+        xm = sum(xs) / len(xs)
+        ym = sum(ys) / len(ys)
+        sxx = sum((x - xm) ** 2 for x in xs)
+        syy = sum((y - ym) ** 2 for y in ys)
+        sxy = sum((x - xm) * (y - ym) for x, y in zip(xs, ys))
+        if sxx * syy - sxy * sxy <= 1e-12:
+            raise ValueError("支腿布置共线, 无法形成稳定支撑平面")
+        return self
+
+
 # ---------------------------------------------------------------- 试吊实测
 class MeasurementIn(BaseModel):
     leg_id: str
@@ -209,6 +333,9 @@ class LiftInput(BaseModel):
         None, description="人工/批准版沿用的实测重心; 提供则优先于试吊反算"
     )
     manual_adjustment: Optional[ManualAdjustmentIn] = None
+    crane: Optional[CraneSetupIn] = Field(
+        None, description="起重机站位与回转路径工况校核; 提供则随核算一并执行"
+    )
     max_pad_shift_m: float = Field(0.5, gt=0)
     request_adjustment: bool = Field(True, description="是否给出自动调整建议")
 

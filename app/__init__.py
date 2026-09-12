@@ -10,12 +10,13 @@
   linalg  -- 纯 Python 三维向量与线性方程组工具(无需 numpy)
   models  -- Pydantic v2 入参/出参模型
   physics -- 核心力学求解
-  svg     -- 带尺寸标注的吊装示意图
+  crane   -- 起重机工况校核(回转路径/载荷表/支腿反力/接地压力)
+  svg     -- 起重机站位图(与 JSON 共用逐姿态数据)
   storage -- SQLite 版本库
   main    -- FastAPI 应用
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # 计算摘要中的算法标识，批准版与复算 JSON 均记录，便于追溯
 CALC_ENGINE_ID = f"liftcalc-core-{__version__}"

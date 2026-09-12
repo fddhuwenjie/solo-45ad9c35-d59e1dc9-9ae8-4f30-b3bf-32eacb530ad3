@@ -34,6 +34,11 @@ _SUMMARY_PATHS = [
     ("utilization_summary.max_shackle_utilization", "最大卸扣利用率"),
     ("utilization_summary.beam_stress_utilization", "吊梁应力利用率"),
     ("utilization_summary.hoist_utilization", "起升机利用率"),
+    ("crane.envelope.max_load_utilization", "起重机载荷利用率"),
+    ("crane.envelope.max_ground_pressure_kpa", "最大接地压力[kPa]"),
+    ("crane.envelope.min_outrigger_reaction_kn", "最小支腿反力[kN]"),
+    ("crane.first_violation.kind", "起重机首个违规"),
+    ("crane.load_chart_summary.fingerprint", "载荷表指纹"),
 ]
 
 _INPUT_SCALAR_PATHS = [
@@ -43,6 +48,9 @@ _INPUT_SCALAR_PATHS = [
     ("lift_acceleration_mps2", "起升加速度[m/s²]"),
     ("min_dynamic_factor", "动载系数下限"),
     ("min_sling_angle_deg", "最小吊索角[°]"),
+    ("crane.boom_length_m", "起重机臂长[m]"),
+    ("crane.hook_block_weight_kn", "吊钩滑轮组重量[kN]"),
+    ("crane.ground_bearing_limit_kpa", "地基承压限值[kPa]"),
 ]
 
 

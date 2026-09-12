@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 from . import CALC_ENGINE_ID, __version__
@@ -119,7 +119,38 @@ def validate_input(inp: LiftInput) -> Dict[str, Any]:
     """仅做参数校验回显(Pydantic 通过即返回规范化输入)。"""
     return {"valid": True, "name": inp.name,
             "n_legs": len(inp.legs), "n_trials": len(inp.trials),
-            "has_beam": inp.beam is not None}
+            "has_beam": inp.beam is not None,
+            "has_crane": inp.crane is not None}
+
+
+@app.post("/api/lifts/crane-check", tags=["lifts"])
+def crane_check(inp: LiftInput) -> Dict[str, Any]:
+    """
+    仅执行起重机工况校核: 回转路径按步长插值, 逐姿态给出作业半径、
+    净额定载荷、支腿反力与接地压力, 并定位首个违规区间。
+    吊钩载荷复用吊装核算的吊钩动载。
+    """
+    if inp.crane is None:
+        raise HTTPException(status_code=400,
+                            detail="输入缺少 crane 字段, 无起重机工况可校核")
+    result = analyze_lift(inp, None)
+    return {"engine": CALC_ENGINE_ID,
+            "hook_load_dynamic_kn": result["weights_kn"]["hook_dynamic"],
+            "crane": result["crane"]}
+
+
+@app.post("/api/lifts/crane-station.svg", tags=["lifts"])
+def crane_station_svg(inp: LiftInput) -> Response:
+    """
+    起重机站位图(SVG): 回转中心、支腿垫板、回转路径与逐姿态采样点。
+    与 /api/lifts/crane-check 的 JSON 共用同一份逐姿态数据。
+    """
+    if inp.crane is None:
+        raise HTTPException(status_code=400,
+                            detail="输入缺少 crane 字段, 无起重机工况可绘制")
+    from .svg import crane_station_svg as _render  # 局部导入, 保持启动轻量
+    result = analyze_lift(inp, None)
+    return Response(content=_render(result["crane"]), media_type="image/svg+xml")
 
 
 @app.get("/api/plans", tags=["plans"])
