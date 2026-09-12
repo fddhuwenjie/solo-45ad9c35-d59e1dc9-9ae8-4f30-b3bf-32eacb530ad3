@@ -49,6 +49,7 @@ _INPUT_SCALAR_PATHS = [
     ("min_dynamic_factor", "动载系数下限"),
     ("min_sling_angle_deg", "最小吊索角[°]"),
     ("crane.boom_length_m", "起重机臂长[m]"),
+    ("crane.config", "起重机配置"),
     ("crane.hook_block_weight_kn", "吊钩滑轮组重量[kN]"),
     ("crane.ground_bearing_limit_kpa", "地基承压限值[kPa]"),
 ]

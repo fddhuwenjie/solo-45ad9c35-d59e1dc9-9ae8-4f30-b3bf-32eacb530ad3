@@ -290,6 +290,145 @@ def test_chart_summary_fingerprint_frozen():
     assert idx_a == idx_b
 
 
+# ---------------------------------------------------------------- 配置隔离
+def dual_config_chart():
+    """同一臂长、同一 side 区段下的 A/B 双配置载荷表。"""
+    return [
+        {"boom_length_m": 20, "config": "A", "zone": "side", "radius_m": 4,
+         "capacity_kn": 1600},
+        {"boom_length_m": 20, "config": "A", "zone": "side", "radius_m": 10,
+         "capacity_kn": 1200},
+        {"boom_length_m": 20, "config": "B", "zone": "side", "radius_m": 4,
+         "capacity_kn": 900},
+        {"boom_length_m": 20, "config": "B", "zone": "side", "radius_m": 10,
+         "capacity_kn": 700},
+    ]
+
+
+def test_chart_capacity_interpolates_within_same_config():
+    idx = _chart_index([LoadChartRowIn(**r) for r in dual_config_chart()])
+    # 同配置相邻档位内各自插值, 互不影响
+    assert chart_capacity(idx, 20, "side", 7, config="A") == pytest.approx(1400.0)
+    assert chart_capacity(idx, 20, "side", 7, config="B") == pytest.approx(800.0)
+
+
+def test_no_cross_config_interpolation():
+    """缺陷复现: A 只有 4 m 档、B 只有 10 m 档, 7 m 处不得跨配置插值出 1400 kN。"""
+    idx = _chart_index([
+        LoadChartRowIn(boom_length_m=20, config="A", zone="side", radius_m=4,
+                       capacity_kn=1600),
+        LoadChartRowIn(boom_length_m=20, config="B", zone="side", radius_m=10,
+                       capacity_kn=1200),
+    ])
+    assert chart_capacity(idx, 20, "side", 7, config="A") is None
+    assert chart_capacity(idx, 20, "side", 7, config="B") is None
+    # 同配置单档精确匹配仍可用; 跨配置精确到对方半径也不可用
+    assert chart_capacity(idx, 20, "side", 4, config="A") == 1600.0
+    assert chart_capacity(idx, 20, "side", 10, config="B") == 1200.0
+    assert chart_capacity(idx, 20, "side", 4, config="B") is None
+    assert chart_capacity(idx, 20, "side", 10, config="A") is None
+
+
+def test_duty_check_out_of_chart_when_config_lacks_adjacent_rows():
+    """同配置无合法相邻档位 -> 判越出载荷表; 切到有档位的配置则正常。"""
+    chart = [
+        {"boom_length_m": 20, "config": "A", "zone": "side", "radius_m": 4,
+         "capacity_kn": 1600},
+        {"boom_length_m": 20, "config": "B", "zone": "side", "radius_m": 4,
+         "capacity_kn": 1600},
+        {"boom_length_m": 20, "config": "B", "zone": "side", "radius_m": 10,
+         "capacity_kn": 1200},
+    ]
+    r_a = check_crane_duty(make_setup(config="A", default_zone="side",
+                                      load_chart=chart), HOOK_DYN)
+    assert [c["code"] for c in r_a["conflicts"]] == ["CRANE_OUT_OF_CHART"]
+    assert all(s["chart_gross_kn"] is None for s in r_a["samples"])
+
+    r_b = check_crane_duty(make_setup(config="B", default_zone="side",
+                                      load_chart=chart), HOOK_DYN)
+    assert r_b["status"] == "ok"
+    assert r_b["samples"][0]["chart_gross_kn"] == pytest.approx(1533.333, abs=1e-3)
+
+
+def test_api_dual_config_no_cross_interpolation(client_no_db):
+    """API 回归: 双配置同区段, 当前配置无相邻档位的半径不得出现插值能力。"""
+    crane = make_setup(
+        config="A", default_zone="side",
+        load_chart=[
+            {"boom_length_m": 20, "config": "A", "zone": "side", "radius_m": 4,
+             "capacity_kn": 1600},
+            {"boom_length_m": 20, "config": "B", "zone": "side", "radius_m": 4,
+             "capacity_kn": 1600},
+            {"boom_length_m": 20, "config": "B", "zone": "side", "radius_m": 10,
+             "capacity_kn": 1200},
+        ],
+    ).model_dump()
+    r = client_no_db.post("/api/lifts/crane-check", json=lift_payload(crane))
+    assert r.status_code == 200, r.text
+    body = r.json()["crane"]
+    assert body["config"] == "A"
+    assert body["load_chart_summary"]["configs"] == ["A", "B"]
+    assert [c["code"] for c in body["conflicts"]] == ["CRANE_OUT_OF_CHART"]
+    gross_values = [s["chart_gross_kn"] for s in body["samples"]]
+    assert all(g is None for g in gross_values)
+    assert 1400.0 not in gross_values  # 旧缺陷在 7 m 处跨配置插值的特征值
+
+    b = client_no_db.post("/api/lifts/analyze", json=lift_payload(crane)).json()
+    assert b["approvable"] is False
+    assert "CRANE_OUT_OF_CHART" in b["blocking_codes"]
+
+
+def test_single_config_default_unchanged():
+    """既有单配置输入(无 config 字段)默认 STD, 结果与修复前一致。"""
+    setup = make_setup()
+    assert setup.config == "STD"
+    assert all(row.config == "STD" for row in setup.load_chart)
+    r = check_crane_duty(setup, HOOK_DYN)
+    assert r["status"] == "ok"
+    assert r["config"] == "STD"
+    assert r["load_chart_summary"]["configs"] == ["STD"]
+    assert r["envelope"]["max_load_utilization"] == pytest.approx(0.8312, abs=1e-3)
+    assert r["samples"][0]["chart_gross_kn"] == pytest.approx(1533.333, abs=1e-3)
+    # 不带 config 实参的旧式查询等价于 STD 配置
+    idx = _chart_index(setup.load_chart)
+    assert chart_capacity(idx, 20, "360", 7) == pytest.approx(1400.0)
+
+
+def test_chart_uniqueness_includes_config(client_no_db):
+    # 同臂长同区段同半径、不同配置: 合法(双配置并存)
+    ok = make_setup(load_chart=[
+        {"boom_length_m": 20, "config": "A", "zone": "360", "radius_m": 4,
+         "capacity_kn": 1600},
+        {"boom_length_m": 20, "config": "B", "zone": "360", "radius_m": 4,
+         "capacity_kn": 1500},
+        {"boom_length_m": 20, "config": "A", "zone": "360", "radius_m": 10,
+         "capacity_kn": 1200},
+        {"boom_length_m": 20, "config": "B", "zone": "360", "radius_m": 10,
+         "capacity_kn": 1100},
+    ])
+    assert len(ok.load_chart) == 4
+    # 同臂长同配置同区段同半径: 重复 -> 422
+    dup = make_setup().model_dump()
+    dup["load_chart"] = [
+        {"boom_length_m": 20, "config": "A", "zone": "360", "radius_m": 4,
+         "capacity_kn": 1600},
+        {"boom_length_m": 20, "config": "A", "zone": "360", "radius_m": 4,
+         "capacity_kn": 1500},
+    ]
+    r = client_no_db.post("/api/lifts/analyze", json=lift_payload(dup))
+    assert r.status_code == 422 and "载荷表存在重复" in r.text
+
+
+def test_chart_fingerprint_covers_config():
+    """配置标识进入载荷表指纹: 仅配置名不同, 指纹即不同(批准版可区分)。"""
+    def fp(cfg):
+        s = make_setup(load_chart=[
+            {"boom_length_m": 20, "config": cfg, "zone": "360", "radius_m": 4,
+             "capacity_kn": 1600}])
+        return check_crane_duty(s, HOOK_DYN)["load_chart_summary"]["fingerprint"]
+    assert fp("A") != fp("B")
+
+
 # ---------------------------------------------------------------- API 集成
 def test_analyze_includes_crane_and_approvable(client_no_db):
     r = client_no_db.post("/api/lifts/analyze",

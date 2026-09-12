@@ -12,7 +12,8 @@
 * 世界系: x 东、y 北、z 向上; 回转中心与吊钩路径均为世界坐标。
 * 起重机参考系: 原点 = 回转中心, x = 吊臂正前方(回转角 0°, 世界方位角
   slew_reference_deg); 随转台回转的部件(slews=True)按吊钩方位角同步旋转。
-* 载荷表按 (臂长, 回转区段) 分组, 仅在相邻半径档位间线性插值, 不外推。
+* 载荷表按 (臂长, 配置, 回转区段) 分组, 仅在同组相邻半径档位间线性插值,
+  不跨配置、不外推。
 * 支腿反力按刚性车体 + 等刚度支座(反力平面分布)求解, 复用
   physics.solve_force_system; 反力为负即支腿拔起(支座不能受拉)。
 * 吊钩处的起升载荷复用吊装核算的吊钩动载(已含构件/索具/吊梁与动载系数)。
@@ -43,42 +44,46 @@ _CONFLICT_CODE = {
 }
 
 _VIOLATION_MESSAGE = {
-    "OUT_OF_CHART": "作业半径越出载荷表(该臂长/回转区段无对应档位, 不允许外推)",
+    "OUT_OF_CHART": "作业半径越出载荷表(该臂长/配置/回转区段无对应档位, 不跨配置、不外推)",
     "CHART_OVERLOAD": "吊钩动载超过载荷表净额定能力",
     "OUTRIGGER_UPLIFT": "支腿反力为负, 支腿拔起(支座不能受拉)",
     "GROUND_OVERPRESSURE": "垫板接地压力超过地基承压限值",
 }
 
 _VIOLATION_EQUATIONS = {
-    "OUT_OF_CHART": ["capacity(r): 仅同臂长同区段相邻半径档位线性插值, 禁止外推"],
-    "CHART_OVERLOAD": ["P_hook_dynamic + W_hook_block <= Q_chart(radius, boom, zone)"],
+    "OUT_OF_CHART": ["capacity(r): 仅同臂长同配置同区段相邻半径档位线性插值, 禁止跨配置与外推"],
+    "CHART_OVERLOAD": ["P_hook_dynamic + W_hook_block <= Q_chart(radius, boom, config, zone)"],
     "OUTRIGGER_UPLIFT": ["R_i = W/n + Σ(wx)·x_i/Σx² + Σ(wy)·y_i/Σy² >= 0"],
     "GROUND_OVERPRESSURE": ["p_i = R_i / A_mat <= p_ground_allow"],
 }
 
 
 # ================================================================ 载荷表
-def _chart_index(rows) -> Dict[Tuple[float, str], List[Tuple[float, float]]]:
-    """(臂长, 区段) -> 按半径升序的 (半径, 能力) 档位。"""
-    idx: Dict[Tuple[float, str], List[Tuple[float, float]]] = {}
+def _chart_index(rows) -> Dict[Tuple[float, str, str], List[Tuple[float, float]]]:
+    """(臂长, 配置, 区段) -> 按半径升序的 (半径, 能力) 档位。"""
+    idx: Dict[Tuple[float, str, str], List[Tuple[float, float]]] = {}
     for r in rows:
-        idx.setdefault((r.boom_length_m, r.zone), []).append((r.radius_m, r.capacity_kn))
+        idx.setdefault((r.boom_length_m, r.config, r.zone), []).append(
+            (r.radius_m, r.capacity_kn))
     for k in idx:
         idx[k].sort()
     return idx
 
 
-def chart_capacity(idx: Dict[Tuple[float, str], List[Tuple[float, float]]],
-                   boom_length_m: float, zone: str, radius_m: float) -> Optional[float]:
+def chart_capacity(idx: Dict[Tuple[float, str, str], List[Tuple[float, float]]],
+                   boom_length_m: float, zone: str, radius_m: float,
+                   config: str = "STD") -> Optional[float]:
     """
-    查载荷表: 同一臂长与回转区段的相邻半径档位间线性插值。
+    查载荷表: 仅在与当前工况相同臂长、配置和回转区段的相邻半径档位间线性插值。
 
-    半径越出档位范围、或无该 (臂长, 区段) 组合时返回 None —— 不外推。
+    同配置没有合法相邻档位(半径越出该配置档位范围、该配置无此区段、
+    或臂长/配置无记录)时返回 None —— 不跨配置合并档位, 不外推。
     单一档位仅在半径精确匹配时给出能力。
+    config 缺省为 "STD", 与未声明配置的单配置载荷表兼容。
     """
     rows = None
-    for (b, z), rr in idx.items():
-        if abs(b - boom_length_m) <= BOOM_TOL and z == zone:
+    for (b, cfg, z), rr in idx.items():
+        if abs(b - boom_length_m) <= BOOM_TOL and cfg == config and z == zone:
             rows = rr
             break
     if rows is None:
@@ -97,7 +102,8 @@ def chart_capacity(idx: Dict[Tuple[float, str], List[Tuple[float, float]]],
 
 def _chart_fingerprint(rows) -> str:
     """载荷表内容指纹(批准版冻结用): 与行的书写顺序无关。"""
-    data = sorted([r.boom_length_m, r.zone, r.radius_m, r.capacity_kn] for r in rows)
+    data = sorted([r.boom_length_m, r.config, r.zone, r.radius_m, r.capacity_kn]
+                  for r in rows)
     blob = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
@@ -205,7 +211,8 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
         slew = _wrap180(azimuth - setup.slew_reference_deg)
         zone = s["zone"] or setup.default_zone
 
-        gross = chart_capacity(idx, setup.boom_length_m, zone, radius)
+        gross = chart_capacity(idx, setup.boom_length_m, zone, radius,
+                               config=setup.config)
         net = gross - setup.hook_block_weight_kn if gross is not None else None
         util = (hook_load_dynamic_kn / net) if (net is not None and net > 0) else None
 
@@ -295,13 +302,15 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
         })
 
     # 载荷表与路径摘要(批准版随摘要冻结, 供版本差异与追溯)
-    boom_rows = [(b, z, r, c) for (b, z), rr in idx.items() for (r, c) in rr
+    boom_rows = [(b, cfg, z, r, c) for (b, cfg, z), rr in idx.items() for (r, c) in rr
                  if abs(b - setup.boom_length_m) <= BOOM_TOL]
     chart_summary = {
         "boom_length_m": setup.boom_length_m,
-        "zones": sorted({z for _b, z, _r, _c in boom_rows}),
-        "radius_range_m": ([round(min(r for _b, _z, r, _c in boom_rows), 4),
-                            round(max(r for _b, _z, r, _c in boom_rows), 4)]
+        "config": setup.config,
+        "configs": sorted({cfg for _b, cfg, _z, _r, _c in boom_rows}),
+        "zones": sorted({z for _b, _cfg, z, _r, _c in boom_rows}),
+        "radius_range_m": ([round(min(r for _b, _cfg, _z, r, _c in boom_rows), 4),
+                            round(max(r for _b, _cfg, _z, r, _c in boom_rows), 4)]
                            if boom_rows else None),
         "entries_total": len(setup.load_chart),
         "fingerprint": _chart_fingerprint(setup.load_chart),
@@ -311,6 +320,7 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
         "status": "ok" if not conflicts else "violation",
         "crane_id": setup.crane_id,
         "boom_length_m": setup.boom_length_m,
+        "config": setup.config,
         "hook_block_weight_kn": setup.hook_block_weight_kn,
         "lifted_load_dynamic_kn": round(hook_load_dynamic_kn, 3),
         "load_chart_summary": chart_summary,

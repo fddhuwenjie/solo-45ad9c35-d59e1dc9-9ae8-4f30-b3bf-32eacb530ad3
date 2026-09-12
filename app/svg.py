@@ -148,8 +148,9 @@ def crane_station_svg(crane: Dict[str, Any]) -> str:
     lines = [
         f'吊钩动载 {_fmt(crane["lifted_load_dynamic_kn"])} kN · '
         f'吊钩滑轮组 {_fmt(crane["hook_block_weight_kn"])} kN',
-        f'臂长 {_fmt(crane["boom_length_m"])} m · 载荷表 {chart["fingerprint"]} '
-        f'(区段 {"、".join(chart["zones"]) or "-"})',
+        f'臂长 {_fmt(crane["boom_length_m"])} m · '
+        f'配置 {escape(str(crane.get("config", "STD")))} · '
+        f'载荷表 {chart["fingerprint"]} (区段 {"、".join(chart["zones"]) or "-"})',
         f'最大载荷利用率 {env["max_load_utilization"]:.1%} · '
         f'最小支腿反力 {_fmt(env["min_outrigger_reaction_kn"])} kN',
         f'最大接地压力 {_fmt(env["max_ground_pressure_kpa"])} kPa / '

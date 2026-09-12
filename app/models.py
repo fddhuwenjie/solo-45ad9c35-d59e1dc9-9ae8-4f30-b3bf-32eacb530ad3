@@ -179,9 +179,13 @@ class OutriggerIn(BaseModel):
 
 
 class LoadChartRowIn(BaseModel):
-    """载荷表一行: 某臂长、某回转区段、某半径档位的额定总能力。"""
+    """载荷表一行: 某臂长、某配置、某回转区段、某半径档位的额定总能力。"""
 
     boom_length_m: float = Field(..., gt=0)
+    config: str = Field(
+        "STD", min_length=1,
+        description="起重机配置标识(配重/支腿状态等), 需与工况 config 一致才可用"
+    )
     zone: str = Field(..., min_length=1, description="回转区段标识, 如 360 / rear / side")
     radius_m: float = Field(..., gt=0)
     capacity_kn: float = Field(..., gt=0, description="该档位额定总能力(含吊钩滑轮组) kN")
@@ -211,6 +215,10 @@ class CraneSetupIn(BaseModel):
         0.0, description="吊臂正前方(回转角 0°)的世界方位角 °(自 +x 逆时针)"
     )
     boom_length_m: float = Field(..., gt=0, description="当前臂长 m(载荷表按此精确匹配)")
+    config: str = Field(
+        "STD", min_length=1,
+        description="当前起重机配置(配重/支腿状态等); 能力查询只用同配置的载荷表档位"
+    )
     components: List[CraneComponentIn] = Field([], description="起重机部件重量与重心")
     counterweight: Optional[CraneCounterweightIn] = None
     hook_block_weight_kn: float = Field(..., ge=0, description="吊钩滑轮组重量 kN")
@@ -237,9 +245,9 @@ class CraneSetupIn(BaseModel):
         cids = [c.id for c in self.components]
         if len(set(cids)) != len(cids):
             raise ValueError("起重机部件 id 重复")
-        keys = [(r.boom_length_m, r.zone, r.radius_m) for r in self.load_chart]
+        keys = [(r.boom_length_m, r.config, r.zone, r.radius_m) for r in self.load_chart]
         if len(set(keys)) != len(keys):
-            raise ValueError("载荷表存在重复的 (臂长, 区段, 半径) 档位")
+            raise ValueError("载荷表存在重复的 (臂长, 配置, 区段, 半径) 档位")
         # 支腿平面布置不得退化(共线时无法形成稳定支撑平面)
         xs = [o.position[0] for o in self.outriggers]
         ys = [o.position[1] for o in self.outriggers]
