@@ -832,7 +832,12 @@ def inverse_cog_from_trials(inp) -> Dict[str, Any]:
                 angle_checks.append((lid, ang_meas, ang_nom))
             if m.tension_kn is None:
                 continue
-            T = m.tension_kn * (1.0 if m.tension_is_static else phi)
+            # 反算在“动载状态”方程中进行(右端 W 含 φ):
+            #   动态张力(起升中测得, tension_is_static=False)直接采用;
+            #   静态张力(静止离地测得)需先乘动载系数 φ 换算为等效动载。
+            # φ=1.1 时: 输入 110 kN 动态 或 100 kN 静态, 进入方程均为 110 kN,
+            # 最终反算静载总重一致(100 kN)。
+            T = m.tension_kn * (phi if m.tension_is_static else 1.0)
             Fsum = [Fsum[k] + T * d_b[k] for k in range(3)]
             rx, ry, rz = geo0.pads[i]
             Msum[0] += T * (ry * d_b[2] - rz * d_b[1])
@@ -1178,35 +1183,29 @@ def evaluate_manual_adjustment(inp) -> Dict[str, Any]:
     new_inp = LiftInput.model_validate(data)
     inverse = inverse_cog_from_trials(new_inp) if new_inp.trials else None
     analysis = analyze_lift(new_inp, inverse)
+    adjustment = recommend_adjustments(new_inp, analysis, inverse) \
+        if new_inp.request_adjustment else None
+    finalize_verdict(analysis, inverse, adjustment)
     analysis["manual_recheck"] = {
         "mode": ma.mode,
         "comment": ma.comment,
         "applied": applied,
         "shims": [s.model_dump() for s in ma.shims],
-        "approvable": analysis["approvable"] if "approvable" in analysis else None,
+        "approvable": analysis["approvable"],
     }
     return analysis
 
 
 # ================================================================ 汇总
-def run_full_analysis(inp) -> Dict[str, Any]:
-    """完整流程: 试吊反算 -> 正式核算 -> 调整建议; 给出 approvable 判定。"""
-    inverse = None
-    if inp.trials:
-        inverse = inverse_cog_from_trials(inp)
-
-    analysis = analyze_lift(inp, inverse)
-
-    adjustment = None
-    if inp.request_adjustment:
-        adjustment = recommend_adjustments(inp, analysis, inverse)
-
+def finalize_verdict(analysis: Dict[str, Any], inverse: Optional[Dict[str, Any]],
+                     adjustment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """汇总反算冲突/证据缺口, 给出 approvable 判定与利用率摘要。"""
     blocking_codes = {c["code"] for c in analysis["conflicts"]}
-    # 无实测重心按证据缺口阻断(不能仅凭理论值批准)
     gaps = list(analysis["evidence_gaps"])
     if inverse is not None:
         blocking_codes |= {c["code"] for c in inverse["conflicts"]}
         gaps += inverse["evidence_gaps"]
+    # 无实测重心按证据缺口阻断(不能仅凭理论值批准)
     approvable = len(blocking_codes) == 0 and not any(
         g["code"] == "NO_VERIFIED_COG" for g in gaps
     )
@@ -1215,9 +1214,16 @@ def run_full_analysis(inp) -> Dict[str, Any]:
     analysis["approvable"] = approvable
     analysis["blocking_codes"] = sorted(blocking_codes)
     analysis["all_evidence_gaps"] = gaps
-    # 总利用率汇总
     analysis["utilization_summary"] = _util_summary(analysis)
     return analysis
+
+
+def run_full_analysis(inp) -> Dict[str, Any]:
+    """完整流程: 试吊反算 -> 正式核算 -> 调整建议; 给出 approvable 判定。"""
+    inverse = inverse_cog_from_trials(inp) if inp.trials else None
+    analysis = analyze_lift(inp, inverse)
+    adjustment = recommend_adjustments(inp, analysis, inverse) if inp.request_adjustment else None
+    return finalize_verdict(analysis, inverse, adjustment)
 
 
 def _util_summary(analysis: Dict[str, Any]) -> Dict[str, Any]:

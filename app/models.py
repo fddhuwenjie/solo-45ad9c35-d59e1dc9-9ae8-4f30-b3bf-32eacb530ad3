@@ -267,18 +267,16 @@ class LiftInput(BaseModel):
 
 # ---------------------------------------------------------------- 版本库相关
 class ReviewSubmitIn(BaseModel):
-    plan_id: str
-    revision: int = Field(..., ge=1)
+    """人工复核动作(提交到某方案某版本)。"""
+
     reviewer: str = Field(..., min_length=1)
     action: Literal["approve", "reject", "request_changes"]
     comment: str = ""
-    input_override: Optional[LiftInput] = Field(
-        None, description="提交复核时可携带含 manual_adjustment 的调整后输入"
-    )
 
 
 class DeriveIn(BaseModel):
-    plan_id: str
-    revision: int = Field(..., ge=1, description="从此版本(通常是已批准版)派生")
-    new_input: LiftInput
+    """从某基版派生新版本。"""
+
+    from_revision: Optional[int] = Field(None, ge=1, description="基版号, 通常为批准版")
     change_note: str = ""
+    input: LiftInput
