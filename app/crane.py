@@ -17,6 +17,9 @@
 * 支腿反力按刚性车体 + 等刚度支座(反力平面分布)求解, 复用
   physics.solve_force_system; 反力为负即支腿拔起(支座不能受拉)。
 * 吊钩处的起升载荷复用吊装核算的吊钩动载(已含构件/索具/吊梁与动载系数)。
+* 提供 crane.clearance 时启用路径净空校核: 姿态随路径同步插值
+  (位置按 path_step_m、姿态按 attitude_step_deg 分别细分), 分离轴法
+  逐点求构件定向包络与轴对齐障碍盒的保守净空, 几何实现见 clearance 模块。
 """
 from __future__ import annotations
 
@@ -25,6 +28,14 @@ import json
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
+from .clearance import (
+    eval_sample as _clr_eval_sample,
+    geodesic_deg,
+    prepare_clearance,
+    rot_matrix,
+    sweep_bound,
+    unwrap_attitudes,
+)
 from .physics import ForceLane, solve_force_system
 
 UPLIFT_TOL = 1.0e-6      # 支腿反力 < -tol 判定拔起 kN
@@ -33,29 +44,42 @@ RADIUS_TOL = 1.0e-6      # 半径档位匹配容差 m
 BOOM_TOL = 1.0e-6        # 臂长匹配容差 m
 
 # 违规类型与优先级(first_violation.kind 取列表中首个)
-_VIOLATION_ORDER = ["OUT_OF_CHART", "CHART_OVERLOAD", "OUTRIGGER_UPLIFT",
-                    "GROUND_OVERPRESSURE"]
+_VIOLATION_ORDER = ["COLLISION", "EXCLUSION_INTRUSION", "OUT_OF_CHART",
+                    "CHART_OVERLOAD", "OUTRIGGER_UPLIFT", "GROUND_OVERPRESSURE",
+                    "CLEARANCE_INSUFFICIENT"]
 
 _CONFLICT_CODE = {
+    "COLLISION": "CRANE_COLLISION",
+    "EXCLUSION_INTRUSION": "CRANE_EXCLUSION_INTRUSION",
     "OUT_OF_CHART": "CRANE_OUT_OF_CHART",
     "CHART_OVERLOAD": "CRANE_CHART_OVERLOAD",
     "OUTRIGGER_UPLIFT": "CRANE_OUTRIGGER_UPLIFT",
     "GROUND_OVERPRESSURE": "CRANE_GROUND_OVERPRESSURE",
+    "CLEARANCE_INSUFFICIENT": "CRANE_CLEARANCE_INSUFFICIENT",
 }
 
 _VIOLATION_MESSAGE = {
+    "COLLISION": "构件包络与障碍物相交(保守净空 < 0)",
+    "EXCLUSION_INTRUSION": "构件包络侵入不可侵入区",
     "OUT_OF_CHART": "作业半径越出载荷表(该臂长/配置/回转区段无对应档位, 不跨配置、不外推)",
     "CHART_OVERLOAD": "吊钩动载超过载荷表净额定能力",
     "OUTRIGGER_UPLIFT": "支腿反力为负, 支腿拔起(支座不能受拉)",
     "GROUND_OVERPRESSURE": "垫板接地压力超过地基承压限值",
+    "CLEARANCE_INSUFFICIENT": "构件包络保守净空低于安全间距",
 }
 
 _VIOLATION_EQUATIONS = {
+    "COLLISION": ["gap(u) = |Δc·u| − Σh_a|a·u| − Σh_b|u| (15 条分离轴取 max)",
+                  "clearance_cons = max_u gap(u) − sweep/2 < 0 ⇒ 包络与障碍相交"],
+    "EXCLUSION_INTRUSION": ["clearance_cons(zone) < 0 ⇒ 侵入不可侵入区(零容忍)"],
     "OUT_OF_CHART": ["capacity(r): 仅同臂长同配置同区段相邻半径档位线性插值, 禁止跨配置与外推"],
     "CHART_OVERLOAD": ["P_hook_dynamic + W_hook_block <= Q_chart(radius, boom, config, zone)"],
     "OUTRIGGER_UPLIFT": ["R_i = W/n + Σ(wx)·x_i/Σx² + Σ(wy)·y_i/Σy² >= 0"],
     "GROUND_OVERPRESSURE": ["p_i = R_i / A_mat <= p_ground_allow"],
+    "CLEARANCE_INSUFFICIENT": ["clearance_cons = max_u gap(u) − sweep/2 < safety_margin_m"],
 }
+
+_CLEARANCE_KINDS = ("COLLISION", "EXCLUSION_INTRUSION", "CLEARANCE_INSUFFICIENT")
 
 
 # ================================================================ 载荷表
@@ -109,19 +133,67 @@ def _chart_fingerprint(rows) -> str:
 
 
 # ================================================================ 路径采样
-def _sample_path(path, step_m: float) -> Tuple[List[Dict[str, Any]], float]:
+def _sample_path(path, step_m: float,
+                 rot_step_deg: Optional[float] = None,
+                 max_samples: Optional[int] = None,
+                 jump_deg: Optional[float] = None
+                 ) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any]]:
     """
-    相邻姿态间按步长线性插值(三维), 返回采样点与路径总长。
+    相邻姿态间插值: 位置按 step_m 线性细分(三维); 提供 rot_step_deg 时
+    姿态(yaw/pitch/roll, 逐轴展开后)同步线性插值, 并按测地转角
+    rot_step_deg 进一步细分 —— 每段分段数取位置与姿态两者所需较大值。
+
+    采样总量超过 max_samples 时各段等比放宽(每段至少 1 段), meta 标记
+    capped; 相邻关键姿态测地转角超过 jump_deg 时记入 meta["jumps"]。
     每个采样点记录所属区段、命中的姿态 id 与回转区段(区段为离散标签,
     区间内取区段起点姿态的区段, 终点姿态用其自身区段)。
     """
-    samples: List[Dict[str, Any]] = []
+    unwrapped: Optional[List[Tuple[float, float, float]]] = None
+    if rot_step_deg is not None:
+        unwrapped = unwrap_attitudes(
+            [(p.yaw_deg, p.pitch_deg, p.roll_deg) for p in path])
+
+    segs: List[Dict[str, Any]] = []
     total = 0.0
+    required = 1
+    jumps: List[Dict[str, Any]] = []
     for k, (a, b) in enumerate(zip(path, path[1:])):
-        pa, pb = a.position, b.position
-        dist = math.dist(pa, pb)
+        dist = math.dist(a.position, b.position)
         total += dist
         n = max(1, math.ceil(dist / step_m - 1e-9))
+        rot = 0.0
+        if unwrapped is not None:
+            rot = geodesic_deg(rot_matrix(*unwrapped[k]),
+                               rot_matrix(*unwrapped[k + 1]))
+            n = max(n, math.ceil(rot / rot_step_deg - 1e-9))
+            if jump_deg is not None and rot > jump_deg:
+                jumps.append({"segment": f"{a.id}->{b.id}",
+                              "from_pose": a.id, "to_pose": b.id,
+                              "rotation_deg": round(rot, 2),
+                              "threshold_deg": jump_deg})
+        segs.append({"a": a, "b": b, "n_req": n, "n": n, "rot_deg": rot})
+        required += n
+
+    capped = False
+    if max_samples is not None and required > max_samples:
+        capped = True
+        factor = max_samples / required
+        used = 1
+        for sg in segs:
+            sg["n"] = max(1, int(sg["n_req"] * factor))
+            used += sg["n"]
+        while used > max_samples:  # 取整后仍超限, 从分段最多者继续削
+            cand = max((sg for sg in segs if sg["n"] > 1),
+                       key=lambda sg: sg["n"], default=None)
+            if cand is None:
+                break
+            cand["n"] -= 1
+            used -= 1
+
+    samples: List[Dict[str, Any]] = []
+    for k, sg in enumerate(segs):
+        a, b, n = sg["a"], sg["b"], sg["n"]
+        pa, pb = a.position, b.position
         for j in range(0 if k == 0 else 1, n + 1):
             t = j / n
             pos = (pa[0] + (pb[0] - pa[0]) * t,
@@ -129,9 +201,16 @@ def _sample_path(path, step_m: float) -> Tuple[List[Dict[str, Any]], float]:
                    pa[2] + (pb[2] - pa[2]) * t)
             at_pose = a.id if j == 0 else (b.id if j == n else None)
             zone = a.zone if j < n else b.zone
-            samples.append({"segment": f"{a.id}->{b.id}", "position": pos,
-                            "at_pose": at_pose, "zone": zone})
-    return samples, total
+            entry: Dict[str, Any] = {"segment": f"{a.id}->{b.id}", "position": pos,
+                                     "at_pose": at_pose, "zone": zone}
+            if unwrapped is not None:
+                ua, ub = unwrapped[k], unwrapped[k + 1]
+                entry["attitude"] = tuple(ua[i] + (ub[i] - ua[i]) * t
+                                          for i in range(3))
+            samples.append(entry)
+    meta = {"required_samples": required, "used_samples": len(samples),
+            "capped": capped, "jumps": jumps}
+    return samples, total, meta
 
 
 # ================================================================ 支腿反力
@@ -189,19 +268,48 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
 
     hook_load_dynamic_kn: 复用吊装核算的吊钩动载(含动载系数的构件+索具+吊梁)。
     返回逐姿态数据(samples, JSON 与 SVG 站位图共用)、包络、首个违规区间与冲突。
+    提供 setup.clearance 时, 采样点同步携带插值姿态与净空结果(保守净空、
+    碰撞/间距不足/侵入标记), 净空冲突与证据缺口一并汇总。
     """
     idx = _chart_index(setup.load_chart)
-    samples, total_len = _sample_path(setup.path, setup.path_step_m)
+    clr = setup.clearance
+    if clr is not None:
+        samples, total_len, samp_meta = _sample_path(
+            setup.path, setup.path_step_m,
+            rot_step_deg=clr.attitude_step_deg,
+            max_samples=clr.max_samples,
+            jump_deg=clr.attitude_jump_deg)
+        clr_ctx = prepare_clearance(clr)
+    else:
+        samples, total_len, samp_meta = _sample_path(setup.path,
+                                                     setup.path_step_m)
+        clr_ctx = None
     cx, cy = setup.slewing_center
     limit = setup.ground_bearing_limit_kpa
+
+    # 净空: 相邻采样间包络表面点最大位移(扫掠界), 供保守净空折减
+    sweeps: List[float] = [0.0] * len(samples)
+    if clr_ctx is not None and not clr_ctx["degenerate"]:
+        for i in range(1, len(samples)):
+            d_hook = math.dist(samples[i - 1]["position"], samples[i]["position"])
+            d_theta = geodesic_deg(rot_matrix(*samples[i - 1]["attitude"]),
+                                   rot_matrix(*samples[i]["attitude"]))
+            sweeps[i] = sweep_bound(d_hook, d_theta, clr_ctx["r_max"])
 
     out_samples: List[Dict[str, Any]] = []
     first_of_kind: Dict[str, Dict[str, Any]] = {}
     first_violation: Optional[Dict[str, Any]] = None
+    clr_first: Optional[Dict[str, Any]] = None
     env = {"max_load_utilization": 0.0,
            "max_ground_pressure_kpa": 0.0,
            "min_outrigger_reaction_kn": math.inf,
            "max_radius_m": 0.0}
+    clr_env = {"min_clearance_m": math.inf,
+               "min_conservative_clearance_m": math.inf,
+               "min_exclusion_conservative_m": math.inf,
+               "worst_obstacle_id": None,
+               "worst_exclusion_id": None,
+               "samples_with_violations": 0}
 
     for i, s in enumerate(samples):
         px, py, pz = s["position"]
@@ -243,13 +351,6 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
             violations.append("OUTRIGGER_UPLIFT")
         if max_p > limit:
             violations.append("GROUND_OVERPRESSURE")
-        violations.sort(key=_VIOLATION_ORDER.index)
-
-        if util is not None:
-            env["max_load_utilization"] = max(env["max_load_utilization"], util)
-        env["max_ground_pressure_kpa"] = max(env["max_ground_pressure_kpa"], max_p)
-        env["min_outrigger_reaction_kn"] = min(env["min_outrigger_reaction_kn"], min_r)
-        env["max_radius_m"] = max(env["max_radius_m"], radius)
 
         entry = {
             "index": i,
@@ -265,8 +366,71 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
             "outriggers": rig,
             "max_pressure_kpa": round(max_p, 2),
             "min_reaction_kn": round(min_r, 3),
-            "violations": violations,
         }
+
+        # ---------- 路径净空(与工况共用同一采样点) ----------
+        clr_entry = None
+        if clr_ctx is not None:
+            att = s["attitude"]
+            entry["attitude_deg"] = {
+                "yaw": round(_wrap180(att[0]), 2),
+                "pitch": round(_wrap180(att[1]), 2),
+                "roll": round(_wrap180(att[2]), 2),
+            }
+            if not clr_ctx["degenerate"]:
+                ev = _clr_eval_sample(clr_ctx, s["position"], att)
+                sweep = max(sweeps[i - 1] if i > 0 else 0.0,
+                            sweeps[i + 1] if i + 1 < len(samples) else 0.0)
+                margin = clr_ctx["safety_margin_m"]
+                c_obs = ev["min_clearance_m"]
+                c_obs_cons = c_obs - sweep / 2.0 if c_obs is not None else None
+                c_exc = ev["exclusion_min_clearance_m"]
+                c_exc_cons = c_exc - sweep / 2.0 if c_exc is not None else None
+                cv: List[str] = []
+                if c_obs_cons is not None:
+                    if c_obs_cons < 0.0:
+                        cv.append("COLLISION")
+                    elif c_obs_cons < margin:
+                        cv.append("CLEARANCE_INSUFFICIENT")
+                if c_exc_cons is not None and c_exc_cons < 0.0:
+                    cv.append("EXCLUSION_INTRUSION")
+                clr_entry = {
+                    "envelope_center": [round(v, 4) for v in ev["envelope_center"]],
+                    "min_clearance_m": (round(c_obs, 4)
+                                        if c_obs is not None else None),
+                    "sweep_margin_m": round(sweep / 2.0, 4),
+                    "conservative_clearance_m": (round(c_obs_cons, 4)
+                                                 if c_obs_cons is not None else None),
+                    "worst_obstacle_id": ev["worst_obstacle_id"],
+                    "exclusion_min_clearance_m": (round(c_exc, 4)
+                                                  if c_exc is not None else None),
+                    "worst_exclusion_id": ev["worst_exclusion_id"],
+                    "violations": cv,
+                }
+                entry["clearance"] = clr_entry
+                violations.extend(cv)
+
+                if c_obs is not None:
+                    clr_env["min_clearance_m"] = min(clr_env["min_clearance_m"], c_obs)
+                if c_obs_cons is not None and \
+                        c_obs_cons <= clr_env["min_conservative_clearance_m"]:
+                    clr_env["min_conservative_clearance_m"] = c_obs_cons
+                    clr_env["worst_obstacle_id"] = ev["worst_obstacle_id"]
+                if c_exc_cons is not None and \
+                        c_exc_cons <= clr_env["min_exclusion_conservative_m"]:
+                    clr_env["min_exclusion_conservative_m"] = c_exc_cons
+                    clr_env["worst_exclusion_id"] = ev["worst_exclusion_id"]
+                if cv:
+                    clr_env["samples_with_violations"] += 1
+
+        violations.sort(key=_VIOLATION_ORDER.index)
+        entry["violations"] = violations
+
+        if util is not None:
+            env["max_load_utilization"] = max(env["max_load_utilization"], util)
+        env["max_ground_pressure_kpa"] = max(env["max_ground_pressure_kpa"], max_p)
+        env["min_outrigger_reaction_kn"] = min(env["min_outrigger_reaction_kn"], min_r)
+        env["max_radius_m"] = max(env["max_radius_m"], radius)
         out_samples.append(entry)
 
         for kind in violations:
@@ -276,9 +440,9 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
                     "position": entry["position"], "radius_m": entry["radius_m"],
                     "zone": zone,
                 }
-        if violations and first_violation is None:
+        if violations:
             prev = out_samples[i - 1]["position"] if i > 0 else entry["position"]
-            first_violation = {
+            hit = {
                 "kind": violations[0],
                 "kinds": violations,
                 "sample_index": i,
@@ -287,6 +451,16 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
                 "radius_m": entry["radius_m"],
                 "zone": zone,
             }
+            if first_violation is None:
+                first_violation = hit
+            if clr_entry is not None and clr_entry["violations"] and clr_first is None:
+                clr_first = dict(hit)
+                clr_first["kind"] = clr_entry["violations"][0]
+                clr_first["kinds"] = clr_entry["violations"]
+                clr_first["conservative_clearance_m"] = \
+                    clr_entry["conservative_clearance_m"]
+                clr_first["worst_obstacle_id"] = clr_entry["worst_obstacle_id"]
+                clr_first["worst_exclusion_id"] = clr_entry["worst_exclusion_id"]
 
     conflicts: List[Dict[str, Any]] = []
     for kind in _VIOLATION_ORDER:
@@ -315,6 +489,80 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
         "entries_total": len(setup.load_chart),
         "fingerprint": _chart_fingerprint(setup.load_chart),
     }
+
+    # 净空汇总与证据缺口(角度跳变/包络退化/障碍无效/采样上限)
+    clr_summary = None
+    evidence_gaps: List[Dict[str, Any]] = []
+    if clr_ctx is not None:
+        evidence_gaps.extend(clr_ctx["evidence_gaps"])
+        if samp_meta["jumps"]:
+            evidence_gaps.append({
+                "code": "CLEARANCE_ATTITUDE_JUMP",
+                "message": "相邻关键姿态转角超过阈值, 插值姿态可能不代表实际转向运动: "
+                           + ", ".join(f"{j['segment']} {j['rotation_deg']}°"
+                                       for j in samp_meta["jumps"]),
+                "evidence": {"segments": samp_meta["jumps"]},
+            })
+        if samp_meta["capped"]:
+            evidence_gaps.append({
+                "code": "CLEARANCE_SAMPLING_CAP",
+                "message": f"按步长需 {samp_meta['required_samples']} 个采样点, 超过上限 "
+                           f"{clr.max_samples}, 已等比放宽至 {samp_meta['used_samples']} 点; "
+                           "采样点之间的净空不再由步长保证",
+                "evidence": {"required_samples": samp_meta["required_samples"],
+                             "used_samples": samp_meta["used_samples"],
+                             "max_samples": clr.max_samples},
+            })
+        n_clr_conf = sum(1 for c in conflicts
+                         if c["code"] in ("CRANE_COLLISION",
+                                          "CRANE_EXCLUSION_INTRUSION",
+                                          "CRANE_CLEARANCE_INSUFFICIENT"))
+        if clr_ctx["degenerate"]:
+            clr_status = "skipped"
+        elif n_clr_conf:
+            clr_status = "violation"
+        else:
+            clr_status = "ok"
+        inf = math.inf
+        clr_summary = {
+            "status": clr_status,
+            "safety_margin_m": clr.safety_margin_m,
+            "attitude_step_deg": clr.attitude_step_deg,
+            "attitude_jump_deg": clr.attitude_jump_deg,
+            "max_samples": clr.max_samples,
+            "envelope": {
+                "length_m": clr.envelope.length_m,
+                "width_m": clr.envelope.width_m,
+                "height_m": clr.envelope.height_m,
+                "hook_to_center_offset": list(clr_ctx["offset"]),
+            },
+            "obstacles_total": len(clr.obstacles),
+            "exclusion_zones_total": len(clr.exclusion_zones),
+            "invalid_obstacle_ids": clr_ctx["invalid_obstacle_ids"],
+            "invalid_exclusion_ids": clr_ctx["invalid_exclusion_ids"],
+            "obstacles": [{"id": o["id"], "min": list(o["min"]),
+                           "max": list(o["max"])} for o in clr_ctx["obstacles"]],
+            "exclusion_zones": [{"id": z["id"], "min": list(z["min"]),
+                                 "max": list(z["max"])}
+                                for z in clr_ctx["exclusion_zones"]],
+            "sampling": {
+                "required_samples": samp_meta["required_samples"],
+                "used_samples": samp_meta["used_samples"],
+                "capped": samp_meta["capped"],
+            },
+            "min_clearance_m": (round(clr_env["min_clearance_m"], 4)
+                                if clr_env["min_clearance_m"] < inf else None),
+            "min_conservative_clearance_m": (
+                round(clr_env["min_conservative_clearance_m"], 4)
+                if clr_env["min_conservative_clearance_m"] < inf else None),
+            "min_exclusion_conservative_m": (
+                round(clr_env["min_exclusion_conservative_m"], 4)
+                if clr_env["min_exclusion_conservative_m"] < inf else None),
+            "worst_obstacle_id": clr_env["worst_obstacle_id"],
+            "worst_exclusion_id": clr_env["worst_exclusion_id"],
+            "samples_with_violations": clr_env["samples_with_violations"],
+            "first_violation": clr_first,
+        }
 
     return {
         "status": "ok" if not conflicts else "violation",
@@ -349,6 +597,8 @@ def check_crane_duty(setup, hook_load_dynamic_kn: float) -> Dict[str, Any]:
             "min_outrigger_reaction_kn": round(env["min_outrigger_reaction_kn"], 3),
             "max_radius_m": round(env["max_radius_m"], 4),
         },
+        "clearance": clr_summary,
         "first_violation": first_violation,
         "conflicts": conflicts,
+        "evidence_gaps": evidence_gaps,
     }

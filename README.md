@@ -5,8 +5,11 @@
 起重机工况校核：吊钩自试吊点回转到安装点的路径上按步长插值，逐姿态核算作业半径、
 载荷表净额定能力（同一臂长、配置与回转区段的相邻档位内插值，不跨配置、不外推）、
 支腿反力与垫板接地压力，定位首个超载 / 支腿拔起 / 越出载荷表 / 地基超压区间；
+路径净空校核：构件包络（定向长方体）随吊钩路径同步插值姿态（yaw/pitch/roll），
+位置按最大位移步长、姿态按最大转角步长分别细分，分离轴法（SAT）逐点求
+障碍物 / 不可侵入区轴对齐盒的保守净空，定位首个碰撞或间距不足区间；
 结果进入 `approvable` 与版本差异，批准版冻结载荷表摘要与路径，
-JSON 与 SVG 站位图共用同一份逐姿态数据。
+JSON 与 SVG 站位图共用同一份逐姿态数据（姿态角与碰撞标记）。
 线性代数为纯 Python 实现（`app/linalg.py`），不依赖 numpy。
 
 ## 环境要求
@@ -91,3 +94,29 @@ SI 制：长度 m，力 kN，质量 kg（内部按 g 换算 kN），角度 °（
 - 相关接口：`POST /api/lifts/crane-check`（仅校核，JSON 逐姿态数据）、
   `POST /api/lifts/crane-station.svg`（站位图，与 JSON 共用同一份逐姿态数据）。
 - 批准版随版本库冻结载荷表摘要（内容指纹）与吊钩路径；工况变化须从批准版 `/derive` 派生。
+
+## 路径净空校核（`crane.clearance` 字段）
+
+吊钩中心线避开厂房立柱，不代表长构件转向时还有足够净空。在 `crane` 中加入
+`clearance` 对象即启用（与工况校核共用同一份路径采样）：
+
+- 输入：构件包络长宽高（`envelope`，本体系长方体）、吊钩至包络中心偏移
+  （`hook_to_center_offset`，本体系，随姿态旋转）、各关键姿态的
+  `yaw_deg/pitch_deg/roll_deg`（挂在 `crane.path` 姿态上，旋转矩阵
+  R = Rz(yaw)·Ry(pitch)·Rx(roll)）、障碍物轴对齐盒（`obstacles`）、
+  不可侵入区（`exclusion_zones`，零容忍）、安全间距（`safety_margin_m`）。
+- 插值：位置按 `path_step_m`、姿态按 `attitude_step_deg`（测地转角）分别细分，
+  每段取两者较大分段数；欧拉角先逐轴展开（最短分支）再线性插值。
+- 校核：包络中心 = 吊钩位置 + R·偏移，定向包络（OBB）与轴对齐盒（AABB）用
+  分离轴法（15 条候选轴）求有符号净空，逐点再减去扫掠修正（相邻采样间包络
+  表面点最大位移的一半），得到覆盖采样区间的保守净空。
+- 冲突码：`CRANE_COLLISION`（保守净空 < 0）、`CRANE_CLEARANCE_INSUFFICIENT`
+  （保守净空低于安全间距）、`CRANE_EXCLUSION_INTRUSION`（侵入不可侵入区）；
+  任一出现即阻断 `approvable`，并进入版本 `diff` 的冲突与摘要差异。
+- 证据缺口（不阻断但随版本记录）：`CLEARANCE_ENVELOPE_DEGENERATE`（包络尺寸
+  非正/非有限，校核跳过）、`CLEARANCE_OBSTACLE_INVALID`（障碍盒 min>=max 或
+  非有限，剔除该盒）、`CLEARANCE_ATTITUDE_JUMP`（相邻姿态转角超
+  `attitude_jump_deg`，插值姿态未必代表实际转向）、`CLEARANCE_SAMPLING_CAP`
+  （所需采样点超 `max_samples`，已等比放宽步长）。
+- SVG 站位图叠加障碍物/不可侵入区足迹与包络逐姿态水平投影，
+  碰撞采样点红色标记，与 JSON 共用同一份姿态角与碰撞标记。

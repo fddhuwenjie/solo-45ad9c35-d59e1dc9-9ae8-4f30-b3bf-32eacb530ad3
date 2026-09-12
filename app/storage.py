@@ -39,6 +39,9 @@ _SUMMARY_PATHS = [
     ("crane.envelope.min_outrigger_reaction_kn", "最小支腿反力[kN]"),
     ("crane.first_violation.kind", "起重机首个违规"),
     ("crane.load_chart_summary.fingerprint", "载荷表指纹"),
+    ("crane.clearance.min_conservative_clearance_m", "最小保守净空[m]"),
+    ("crane.clearance.min_exclusion_conservative_m", "不可侵入区最小净空[m]"),
+    ("crane.clearance.first_violation.kind", "净空首个违规"),
 ]
 
 _INPUT_SCALAR_PATHS = [
@@ -52,6 +55,7 @@ _INPUT_SCALAR_PATHS = [
     ("crane.config", "起重机配置"),
     ("crane.hook_block_weight_kn", "吊钩滑轮组重量[kN]"),
     ("crane.ground_bearing_limit_kpa", "地基承压限值[kPa]"),
+    ("crane.clearance.safety_margin_m", "安全间距[m]"),
 ]
 
 

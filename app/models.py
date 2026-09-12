@@ -192,18 +192,94 @@ class LoadChartRowIn(BaseModel):
 
 
 class HookPoseIn(BaseModel):
-    """吊钩路径上的一个姿态(试吊点 -> 安装点, 世界坐标)。"""
+    """吊钩路径上的一个姿态(试吊点 -> 安装点, 世界坐标)。
+
+    yaw/pitch/roll 为构件在该关键姿态的本体姿态角 °(旋转矩阵
+    R = Rz(yaw)·Ry(pitch)·Rx(roll)), 仅路径净空校核使用; 缺省 0。
+    """
 
     id: str = Field(..., min_length=1)
     position: Vec3 = Field(..., description="吊钩位置 [x,y,z] m(世界系)")
     zone: Optional[str] = Field(
         None, description="该姿态所在回转区段; 缺省用起重机 default_zone"
     )
+    yaw_deg: float = Field(0.0, description="偏航角 °(绕世界 z, 自 +x 逆时针)")
+    pitch_deg: float = Field(0.0, description="纵倾角 °(绕 y, 抬头为正)")
+    roll_deg: float = Field(0.0, description="横倾角 °(绕 x)")
 
     @field_validator("position")
     @classmethod
     def _p3(cls, v: Vec3) -> Vec3:
         return (float(v[0]), float(v[1]), float(v[2]))
+
+
+# ---------------------------------------------------------------- 路径净空校核
+class EnvelopeIn(BaseModel):
+    """构件包络长方体(本体系, 边沿本体轴)。
+
+    尺寸非正/非有限视为退化: 不在此拒绝输入, 校核时列为证据缺口并跳过。
+    """
+
+    length_m: float = Field(..., description="包络长(本体 x 向) m; <=0 视为退化")
+    width_m: float = Field(..., description="包络宽(本体 y 向) m; <=0 视为退化")
+    height_m: float = Field(..., description="包络高(本体 z 向) m; <=0 视为退化")
+
+
+class ObstacleBoxIn(BaseModel):
+    """世界系轴对齐盒(AABB): 障碍物或不可侵入区。
+
+    min>=max 或坐标非有限视为无效几何: 不在此拒绝输入, 校核时剔除该盒
+    并列为证据缺口。
+    """
+
+    id: str = Field(..., min_length=1)
+    min_corner: Vec3 = Field(..., description="盒最小角 [x,y,z] m(世界系)")
+    max_corner: Vec3 = Field(..., description="盒最大角 [x,y,z] m(世界系)")
+
+    @field_validator("min_corner", "max_corner")
+    @classmethod
+    def _c3(cls, v: Vec3) -> Vec3:
+        return (float(v[0]), float(v[1]), float(v[2]))
+
+
+class ClearanceIn(BaseModel):
+    """路径净空校核配置: 构件包络 + 姿态插值 + 障碍物/不可侵入区。
+
+    沿 crane.path 同步插值位置与姿态: 位置按 crane.path_step_m、姿态按
+    attitude_step_deg 分别细分(取较大分段数); 定向包络与轴对齐盒用
+    分离轴法逐点求保守净空。
+    """
+
+    envelope: EnvelopeIn
+    hook_to_center_offset: Vec3 = Field(
+        ..., description="吊钩至包络中心偏移 [x,y,z] m(本体系, 随姿态旋转)"
+    )
+    obstacles: List[ObstacleBoxIn] = Field([], description="障碍物轴对齐盒")
+    exclusion_zones: List[ObstacleBoxIn] = Field(
+        [], description="不可侵入区轴对齐盒(零容忍, 不计安全间距)"
+    )
+    safety_margin_m: float = Field(0.5, ge=0, description="障碍物安全间距 m")
+    attitude_step_deg: float = Field(
+        5.0, gt=0, description="姿态插值最大转角步长 °(按测地转角细分)"
+    )
+    attitude_jump_deg: float = Field(
+        120.0, gt=0, description="相邻关键姿态转角超过该值列为角度跳变证据缺口 °"
+    )
+    max_samples: int = Field(
+        1000, ge=4, description="路径采样点总数上限; 不足时等比放宽步长并列证据缺口"
+    )
+
+    @field_validator("hook_to_center_offset")
+    @classmethod
+    def _o3(cls, v: Vec3) -> Vec3:
+        return (float(v[0]), float(v[1]), float(v[2]))
+
+    @model_validator(mode="after")
+    def _chk(self) -> "ClearanceIn":
+        ids = [o.id for o in self.obstacles] + [z.id for z in self.exclusion_zones]
+        if len(set(ids)) != len(ids):
+            raise ValueError("障碍物/不可侵入区 id 重复")
+        return self
 
 
 class CraneSetupIn(BaseModel):
@@ -228,6 +304,9 @@ class CraneSetupIn(BaseModel):
     load_chart: List[LoadChartRowIn] = Field(..., min_length=1)
     path: List[HookPoseIn] = Field(..., min_length=2, description="试吊点 -> 安装点的吊钩路径")
     path_step_m: float = Field(1.0, gt=0, description="相邻姿态间的插值步长 m")
+    clearance: Optional[ClearanceIn] = Field(
+        None, description="路径净空校核配置; 提供则沿吊钩路径同步插值姿态并逐点校核"
+    )
 
     @field_validator("slewing_center")
     @classmethod
